@@ -390,7 +390,8 @@ end
 
 local function clean_local()
   local d = M.options.local_dir
-  rex.exec({ "find", d, "-mindepth", "2", "-type", "f", "-mmin", "+1440", "-delete" })
+  rex.exec({ "find", d, "-mindepth", "1", "-type", "f", "-mmin", "+1440", "-delete" })
+  rex.exec({ "find", d, "-maxdepth", "1", "-name", "worker.log", "-size", "+1024k", "-delete" })
   rex.exec({ "find", d, "-mindepth", "1", "-type", "d", "-empty", "-delete" })
 end
 

@@ -16,7 +16,7 @@ Le module colle seulement du texte. Il ne dépend d'aucun agent. Il ne convertit
 
 ## Fonctionnement
 
-- **Pane sur le Mac.** Le module colle le chemin d'origine. Il ne copie rien. Une image brute du presse-papiers (capture d'écran) est enregistrée dans `$TMPDIR/rex-file-paste/`, puis son chemin est collé.
+- **Pane sur le Mac.** Le module colle le chemin d'origine. Il ne copie rien. Une image brute du presse-papiers (capture d'écran) est enregistrée dans `$TMPDIR/rex-file-paste/`, puis son chemin est collé. Ce fichier est supprimé après un jour.
 - **Pane sur un autre serveur.** Le module copie chaque fichier vers `/tmp/rex-file-paste-<uid>/<hash>/<nom d'origine>`. `<hash>` vient du SHA-256 du contenu. Un fichier déjà présent avec le même contenu n'est pas renvoyé.
 - **Chemins.** Les chemins collés sont protégés pour le shell, comme quand vous déposez un fichier dans un terminal : une barre oblique inverse précède chaque espace, apostrophe ou parenthèse (`Rapport\ d\'été.pdf`). Les lettres accentuées restent telles quelles. Le nom copié est en forme Unicode composée (NFC).
 - **Images.** Avant une copie, le module convertit en PNG les formats que les agents ne lisent pas (HEIC, TIFF, BMP). Il réduit les images dont le grand côté dépasse 2000 px. Les autres fichiers sont copiés sans modification.
