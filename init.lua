@@ -24,7 +24,22 @@ M.version = "0.1.0"
 
 local function this_dir()
   local src = debug.getinfo(1, "S").source or ""
-  return src:match("^@(.*)/[^/]*$")
+  local dir = src:match("^@?(.*)/[^/]*$")
+  if not dir or dir:sub(1, 1) == "/" then return dir end
+  -- Rex's configuration loads modules by a path relative to the directory
+  -- of init.lua, such as rex-file-paste/init.lua.
+  local config = os.getenv("REX_CONFIG")
+  local base = config and config:match("^(.*)/[^/]*$")
+  if not base then
+    local xdg = os.getenv("XDG_CONFIG_HOME")
+    if not xdg or xdg == "" then xdg = (os.getenv("HOME") or "") .. "/.config" end
+    base = xdg .. "/rex"
+  end
+  for _, d in ipairs({ base .. "/" .. dir, (os.getenv("PWD") or ".") .. "/" .. dir }) do
+    local f = io.open(d .. "/worker.lua")
+    if f then f:close() return d end
+  end
+  return dir
 end
 
 M.options = {
