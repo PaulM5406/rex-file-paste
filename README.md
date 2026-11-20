@@ -43,7 +43,7 @@ Sur le Mac, clonez le dépôt à côté de votre `init.lua` Rex. Le fichier est 
 
 ```sh
 mkdir -p ~/.config/rex
-git clone /Users/paulmilesi/Repos/Perso/rex-file-paste ~/.config/rex/rex-file-paste
+git clone https://github.com/PaulM5406/rex-file-paste ~/.config/rex/rex-file-paste
 ```
 
 Ajoutez cette ligne à `~/.config/rex/init.lua` :
