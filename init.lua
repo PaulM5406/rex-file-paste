@@ -39,7 +39,7 @@ M.options = {
   -- shrink them (max_dimension), before a copy. false sends images unchanged.
   convert_images = true,
   -- A copy is abandoned after timeout seconds plus the time to send the
-  -- data at min_rate_mb MiB/s. Measured: about 2.5 MiB/s over Tailscale.
+  -- data at min_rate_mb MiB/s. Measured: 20 MB in 11 s over Tailscale.
   timeout = 15,
   min_rate_mb = 0.5,
   -- Show a progress bar when the copy has run this many seconds.
