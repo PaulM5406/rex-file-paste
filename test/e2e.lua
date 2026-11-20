@@ -364,8 +364,11 @@ end)
 case("name", function()
   seed("files", F.name)
   expect_paste("name", sources(F.name), function(r)
-    check(r.paths[1]:sub(-#"Rapport d'été — n°2 (final).pdf") == "Rapport d'été — n°2 (final).pdf",
-      "name: name not kept: " .. r.paths[1])
+    -- Locally the pasted path is the one macOS gives, often decomposed
+    -- (NFD); the shell check above shows it names the file. A copy keeps
+    -- the name in composed form (NFC), as written here.
+    if host then check(r.paths[1]:sub(-#"Rapport d'été — n°2 (final).pdf") == "Rapport d'été — n°2 (final).pdf",
+      "name: name not kept: " .. r.paths[1]) end
   end)
 end)
 

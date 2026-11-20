@@ -66,7 +66,7 @@ local IMAGE_EXT = { png = true, jpg = true, jpeg = true, gif = true, webp = true
 -- Agents read PNG, JPEG, GIF, and WebP. Other image formats become PNG.
 local KEEP_FORMAT = { png = true, jpg = true, jpeg = true, gif = true, webp = true }
 
--- Prints JSON: {"kind":"files","paths":[...]}, {"kind":"image","format":
+-- Prints JSON: {"kind":"files","paths":[...],"names":[...]}, {"kind":"image","format":
 -- "png"|"tiff","path":...} after saving a raw image to argv[0].<format>, or
 -- {"kind":"none"}.
 local CLIPBOARD_JS = [=[
@@ -77,9 +77,15 @@ function run(argv) {
   const opts = $.NSDictionary.dictionaryWithObjectForKey(true, $.NSPasteboardURLReadingFileURLsOnlyKey);
   const urls = pb.readObjectsForClassesOptions($([$.NSURL]), opts);
   if (urls && !urls.isNil() && urls.count > 0) {
-    const paths = [];
-    for (let i = 0; i < urls.count; i++) paths.push(ObjC.unwrap(urls.objectAtIndex(i).path));
-    return JSON.stringify({ kind: 'files', paths: paths });
+    // A file URL's path is often decomposed (NFD). Keep it as it is for the
+    // Mac, and give the name in composed form (NFC), as people type it.
+    const paths = [], names = [];
+    for (let i = 0; i < urls.count; i++) {
+      const path = ObjC.unwrap(urls.objectAtIndex(i).path);
+      paths.push(path);
+      names.push(path.replace(/\/+$/, '').split('/').pop().normalize('NFC'));
+    }
+    return JSON.stringify({ kind: 'files', paths: paths, names: names });
   }
   for (const [type, format] of [[$.NSPasteboardTypePNG, 'png'], [$.NSPasteboardTypeTIFF, 'tiff']]) {
     const data = pb.dataForType(type);
@@ -286,8 +292,9 @@ local function read_clipboard()
 end
 
 -- Checks one copied file and returns its entry, or fails with the reason.
-local function check_file(path)
-  if has_control(path) then
+local function check_file(path, name)
+  name = name or basename(path)
+  if has_control(path) or has_control(name) then
     fail("refused: a file name has a control character or a line break: "
       .. path:gsub("%c", "?"))
   end
@@ -295,12 +302,11 @@ local function check_file(path)
   if not (r and r.ok) then fail("cannot read " .. path) end
   local kind, size = r.stdout:match("^([^\t]+)\t(%d+)")
   if kind == "Directory" then
-    fail("refused: " .. basename(path) .. " is a folder; copy the files inside it instead")
+    fail("refused: " .. name .. " is a folder; copy the files inside it instead")
   end
   if kind ~= "Regular File" then
-    fail("refused: " .. basename(path) .. " is not a regular file")
+    fail("refused: " .. name .. " is not a regular file")
   end
-  local name = basename(path)
   return { src = path, name = name, size = tonumber(size), image = IMAGE_EXT[extension(name)] or false }
 end
 
@@ -308,7 +314,7 @@ end
 local function clipboard_entries(clip)
   local entries = {}
   if clip.kind == "files" then
-    for i, path in ipairs(clip.paths) do entries[i] = check_file(path) end
+    for i, path in ipairs(clip.paths) do entries[i] = check_file(path, clip.names and clip.names[i]) end
   else
     local r = rex.exec({ "stat", "-f", "%z", clip.path })
     entries[1] = { src = clip.path, name = "clipboard-image." .. clip.format,
@@ -401,11 +407,20 @@ local function host_label(name)
   return name
 end
 
+-- The worker runs with the same rex executable as the server: the one on
+-- PATH, else the process that started this shell (the server itself runs
+-- as `rex server run`), else the place the Mac app installs it.
 local function rex_path()
   if M.options.rex_path then return M.options.rex_path end
-  local r = rex.exec({ "sh", "-c", "command -v rex || ps -o comm= -p $PPID" })
-  local path = r and r.ok and r.stdout:match("^([^\n]+)")
-  if path and path:find("/") then return path end
+  local r = rex.exec({ "sh", "-c", [[
+command -v rex && exit
+p=$(ps -o comm= -p $PPID)
+case $p in /*/rex) echo "$p"; exit;; esac
+p="$HOME/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex"
+[ -x "$p" ] && echo "$p"
+]] })
+  local path = r and r.stdout:match("^(/[^\n]+)")
+  if path then return path end
   fail("cannot find the rex executable; set rex_path in setup{}")
 end
 
@@ -549,17 +564,26 @@ local function upload(api, session_id, file, state)
       state.check("starting the copy")
       sleep(0.02)
     end
-    local encoded = exec({ "base64", "-i", file.path }):gsub("[\r\n]", "")
+    state.mark("remote ready for " .. file.name)
+    -- macOS base64 writes one line. Drop its line end without scanning the
+    -- whole text; scan only if it ever wraps lines.
+    local encoded = exec({ "base64", "-i", file.path })
+    local last = #encoded
+    while last > 0 and encoded:byte(last) <= 32 do last = last - 1 end
+    encoded = encoded:sub(1, last)
+    if #encoded ~= len then encoded = encoded:gsub("%s", "") end
+    state.mark("encoded " .. file.name)
     if #encoded ~= len then fail("unexpected base64 length for " .. file.name) end
     local n = 0
     for i = 1, #encoded, CHUNK do
       must("copy", call, "write", { data = encoded:sub(i, i + CHUNK - 1) })
       n = n + 1
       state.sent = state.sent + math.min(CHUNK, #encoded - i + 1)
-      if n % 8 == 0 then state.tick() end
+      if n % 16 == 0 then state.tick() end
       state.check(string.format("copying %s (%s of %s sent)", file.name, mb(state.sent * 3 / 4), mb(state.total * 3 / 4)))
     end
     state.tick()
+    state.mark(string.format("sent %d requests for %s", n, file.name))
     while true do
       local got, uid = screen():match("REXFP%-OK (%x+) (%d+)")
       if got then
@@ -602,15 +626,18 @@ function M.run_job(job_path)
     local stop = os.time() + math.ceil(seconds)
     local state = { sent = 0, total = total, deadline = started + seconds }
     local last_tick = 0
+    state.mark = mark
     -- os.time() costs nothing; now() starts a process, so it is kept for ticks.
     function state.check(doing)
       if os.time() >= stop then
         fail(string.format("gave up %s after %ds", doing, math.floor(seconds)))
       end
     end
+    -- Each update is one more request, so update about once a second.
+    local started_s = os.time()
     function state.tick()
-      local t = now()
-      if t - started < M.options.progress_after or t - last_tick < 0.3 or total == 0 then return end
+      local t = os.time()
+      if t - started_s < M.options.progress_after or t - last_tick < 1 or total == 0 then return end
       last_tick = t
       bar.update(state.sent / total, string.format("%s / %s", mb(state.sent * 3 / 4), mb(total * 3 / 4)))
     end
