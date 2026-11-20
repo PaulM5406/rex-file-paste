@@ -27,7 +27,7 @@ Le module colle seulement du texte. Il ne dépend d'aucun agent. Il ne convertit
 1. L'action `file_paste` tourne dans le serveur Rex du Mac. Elle lit le presse-papiers avec `osascript` (JXA, `NSPasteboard`) et contrôle les fichiers.
 2. Rex arrête une action de configuration après 30 secondes. Pour un pane distant, l'action écrit donc un fichier de tâche et lance un processus `rex do worker.lua` détaché. Puis elle rend la main. Un script `rex do` n'a pas de limite de durée.
 3. Le worker ouvre un terminal caché sur le serveur distant. Ce terminal lance `sh` avec un script fixe. Les noms de fichier arrivent en arguments, jamais dans le texte du script. Le terminal passe en mode raw et lit le fichier en base64 avec `head -c N | base64 -d`.
-4. Le worker envoie le base64 par requêtes `block.method write` de 63 KiB. Rex refuse une requête de plus de 64 KiB.
+4. Le worker envoie le base64 par requêtes `block.method write` de 63 KiB. Rex refuse une requête de plus de 64 KiB. Chaque requête attend sa réponse, donc un seul flux est limité par la latence. Un fichier de 2 Mio ou plus est donc découpé en 8 parts. Chaque part a son processus `rex do` et son terminal caché. Le serveur distant assemble les parts, puis les décode.
 5. Le serveur distant renvoie le SHA-256 du fichier. Le worker le compare à celui du Mac.
 6. Le worker colle les chemins par un événement `paste` (bracketed paste).
 
@@ -73,6 +73,8 @@ Rex charge les modules depuis le dossier de l'`init.lua` qu'il ouvre. Si `init.l
 | `convert_images` | `true` | `false` : les images sont copiées sans conversion ni réduction. |
 | `timeout` | `15` | Secondes ajoutées au délai d'abandon. |
 | `min_rate_mb` | `0.5` | Débit minimal supposé, en Mio/s. Délai d'abandon = `timeout` + taille / `min_rate_mb`. |
+| `parallel` | `8` | Nombre de parts envoyées en même temps pour un gros fichier. `1` : un seul flux. |
+| `parallel_min_mb` | `2` | Taille, en Mio, à partir de laquelle un fichier est découpé. |
 | `progress_after` | `2` | Secondes de copie avant l'affichage de la progression. |
 | `notify` | `true` | Notification macOS si une copie en arrière-plan échoue. |
 | `local_dir` | `$TMPDIR/rex-file-paste` | Dossier du Mac pour les tâches, les images et le journal `worker.log`. |
@@ -81,7 +83,7 @@ Rex charge les modules depuis le dossier de l'`init.lua` qu'il ouvre. Si `init.l
 ## Limites
 
 - **Taille.** Une copie de plus de `max_size_mb` (25 Mio par défaut, total des fichiers) est refusée. Rien n'est collé. La limite ne s'applique pas à un pane local, car rien n'est copié.
-- **Débit.** Mesuré vers un serveur Linux par Tailscale : environ 1,8 Mo/s, soit 11 s pour un fichier de 20 Mo. Le débit dépend de la latence, car chaque requête attend sa réponse.
+- **Débit.** Mesuré vers un serveur Linux par Tailscale (latence 18 ms), pour un fichier de 20 Mo : 11,7 s en un flux, 3,6 s en 4 parts, 2,2 s en 8 parts (défaut), 1,9 s en 12 parts. Pour comparaison, scp prend 1,15 s.
 - **Dossiers.** Un dossier est refusé, avec un message. Copiez les fichiers qu'il contient.
 - **Noms.** Un nom qui contient un caractère de contrôle (saut de ligne, tabulation, etc.) est refusé.
 - **Plusieurs fichiers.** Si un seul fichier est refusé, aucun n'est collé.
@@ -99,7 +101,7 @@ rex do test/e2e.lua host=LABEL               # tous les cas, pane sur un autre s
 rex do test/e2e.lua host=LABEL kind=big      # un seul cas
 ```
 
-Cas : `pdf`, `docx`, `name`, `two`, `big`, `over`, `text`, `folder`, `ctrl`, `tab`, `image`, `heic`, `cleanup`. Le test compare le SHA-256 de chaque fichier source et du fichier collé, après lecture du texte collé par `sh` et `bash` (distant) ou `sh` et `zsh` (local). Il ferme ses terminaux, détruit sa session distante et supprime ses fichiers à la fin.
+Cas : `pdf`, `docx`, `name`, `two`, `big`, `over`, `text`, `folder`, `ctrl`, `tab`, `image`, `heic`, `progress`, `cleanup`. Les cas `progress` et `cleanup` exigent un serveur distant. `parallel=N` change le nombre de parts. Le test compare le SHA-256 de chaque fichier source et du fichier collé, après lecture du texte collé par `sh` et `bash` (distant) ou `sh` et `zsh` (local). Il ferme ses terminaux, détruit sa session distante et supprime ses fichiers à la fin.
 
 ## Désinstallation
 

@@ -5,9 +5,9 @@
 --   rex do test/e2e.lua host=LABEL kind=pdf    # one case
 --
 -- kind is all (the default) or one of: pdf, docx, name, two, big, over,
--- text, folder, ctrl, tab, image, heic, cleanup (remote only).
+-- text, folder, ctrl, tab, image, heic, progress and cleanup (remote only).
 -- work=DIR puts the test files there (default: $TMPDIR/rex-file-paste-test).
--- keep=1 keeps them.
+-- keep=1 keeps them. parallel=N sets the number of parts for large files.
 --
 -- The test uses a private pasteboard, so it never changes your clipboard.
 -- Locally it pastes into a hidden terminal. On another server it creates a
@@ -28,6 +28,7 @@ M.options.pasteboard = "rex-file-paste-test"
 M.options.local_dir = work .. "/local"
 M.options.module_dir = root
 M.options.notify = false
+if rex.args.parallel then M.options.parallel = tonumber(rex.args.parallel) end
 
 local SEED_JS = [=[
 ObjC.import('AppKit');
@@ -79,6 +80,7 @@ local F = {
   name = src .. "/Rapport d'été — n°2 (final).pdf",
   csv = src .. "/data.csv",
   big = src .. "/big-20MB.bin",
+  big2 = src .. "/stream-20MB.bin",
   over = src .. "/over-30MiB.bin",
   folder = src .. "/Un dossier",
   ctrl = src .. "/bad\nname.txt",
@@ -386,9 +388,30 @@ case("big", function()
       log("  20 MB copy: %.2fs in the worker, timeout %.0fs, progress bar %s, last line: %s",
         r.seconds or -1, r.timeout or -1, tostring(r.progress), tostring(r.progress_line))
       log("  program_status of the progress terminal: %s", rex.json.encode(r.program_status or {}))
-      check(r.progress == true, "big: no progress bar")
+      log("  parts: %s", rex.json.encode(r.parts or {}))
+      check((r.parts or {})[1] == M.options.parallel, "big: not sent in parts")
+      -- The bar shows only after 2 s, counted in whole seconds.
+      if r.seconds > 3.5 then check(r.progress == true, "big: no progress bar") end
     end
   end)
+end)
+
+case("progress", function()
+  if not host then log("  remote only, skipped") return end
+  -- One stream takes about 11 s for 20 MB, so the bar must show.
+  sh('head -c 20000000 /dev/urandom > "$1"', F.big2)
+  seed("files", F.big2)
+  local saved = M.options.parallel
+  M.options.parallel = 1
+  expect_paste("progress", sources(F.big2), function(r)
+    log("  20 MB in one stream: %.2fs, progress bar %s, last line: %s", r.seconds or -1,
+      tostring(r.progress), tostring(r.progress_line))
+    log("  program_status of the progress terminal: %s", rex.json.encode(r.program_status or {}))
+    check(r.progress == true, "progress: no progress bar")
+    check((r.program_status or { records = {} }).records[1] and r.program_status.records[1].progress == 100,
+      "progress: no OSC 7501 progress")
+  end)
+  M.options.parallel = saved
 end)
 
 case("over", function()

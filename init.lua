@@ -42,6 +42,13 @@ M.options = {
   -- data at min_rate_mb MiB/s. Measured: 20 MB in 11 s over Tailscale.
   timeout = 15,
   min_rate_mb = 0.5,
+  -- A file of at least parallel_min_mb MiB is sent in this many parts at
+  -- once, one `rex do` process each. Each request waits for its answer, so
+  -- one stream is bound by latency. Measured over Tailscale, 20 MB: 11.7 s
+  -- in 1 stream, 3.6 s in 4 parts, 2.2 s in 8, 1.9 s in 12. 1 sends every
+  -- file in one stream.
+  parallel = 8,
+  parallel_min_mb = 2,
   -- Show a progress bar when the copy has run this many seconds.
   progress_after = 2,
   -- Report background failures with a macOS notification.
@@ -99,21 +106,23 @@ function run(argv) {
 ]=]
 
 -- Runs on the remote machine as:
---   sh -c SCRIPT rex-file-paste KEY NAME LENGTH SECONDS SHA256
+--   sh -c SCRIPT rex-file-paste KEY NAME LENGTH SECONDS SHA256 PARTS
 -- Every value arrives as an argument; nothing is put into the script text.
 -- The file goes to /tmp/rex-file-paste-UID/KEY/NAME. If that file, or a file
 -- with the same key, already has SHA256, the script reports a hit.
--- Otherwise it puts the terminal in raw mode, reads LENGTH bytes of base64,
--- and reports the checksum of what it decoded.
+-- With PARTS 0, it puts the terminal in raw mode, reads LENGTH bytes of
+-- base64, and reports the checksum of what it decoded. With PARTS N, it
+-- prints a token, waits until N part terminals (PART_SCRIPT) have received
+-- the base64 in parts, joins and decodes them, and reports the checksum.
 local REMOTE_SCRIPT = [=[
 umask 077
 say() { printf '\r\nREXFP-%s\r\n' "$*"; }
 fail() { say "ERR $*"; sleep 60; exit 1; }
 sum() { { sha256sum 2>/dev/null || shasum -a 256; } < "$1" | cut -c1-64; }
-key=$1 name=$2 len=$3 secs=$4 want=$5
+key=$1 name=$2 len=$3 secs=$4 want=$5 parts=${6:-0}
 case $key in ''|*[!0-9a-f]*) fail "bad key";; esac
 case $name in ''|.|..|*/*) fail "bad file name";; esac
-case $len$secs in ''|*[!0-9]*) fail "bad length";; esac
+case $len$secs$parts in ''|*[!0-9]*) fail "bad length";; esac
 uid=$(id -u)
 d="/tmp/rex-file-paste-$uid"
 [ -L "$d" ] && fail "$d is a symbolic link"
@@ -135,14 +144,58 @@ for g in "$k"/*; do
   fi
 done
 t="$f.part.$$"
-trap 'rm -f "$t"' EXIT
+p="$k/.rexfp.$$"
+trap 'rm -f "$t" "$p".*' EXIT
 stty raw -echo 2>/dev/null || fail "cannot set the terminal mode"
 ( sleep "$secs"; kill 0 ) 2>/dev/null &
+if [ "$parts" -gt 0 ]; then
+  say "PARTS $$"
+  i=0
+  while [ "$i" -lt "$parts" ]; do
+    if [ -f "$p.$i.ok" ]; then i=$((i + 1)); else sleep 0.05 2>/dev/null || sleep 1; fi
+  done
+  join() { i=0; while [ "$i" -lt "$parts" ]; do cat "$p.$i" || return 1; i=$((i + 1)); done; }
+  if join | base64 -d > "$t" && mv -f "$t" "$f"; then
+    say "OK $(sum "$f") $uid"
+  else
+    say "ERR could not decode the copy"
+  fi
+  rm -f "$p".*
+  sleep 60
+  exit 0
+fi
 say READY
 if head -c "$len" | base64 -d > "$t" && mv -f "$t" "$f"; then
   say "OK $(sum "$f") $uid"
 else
   say "ERR could not decode the copy"
+fi
+sleep 60
+]=]
+
+-- Runs on the remote machine, in one terminal per part, as:
+--   sh -c PART_SCRIPT rex-file-paste KEY TOKEN INDEX LENGTH SECONDS
+-- It reads LENGTH bytes of base64 into the part file that REMOTE_SCRIPT,
+-- with the same KEY and TOKEN, waits for.
+local PART_SCRIPT = [=[
+umask 077
+say() { printf '\r\nREXFP-%s\r\n' "$*"; }
+fail() { say "ERR $*"; sleep 60; exit 1; }
+key=$1 token=$2 idx=$3 len=$4 secs=$5
+case $key in ''|*[!0-9a-f]*) fail "bad key";; esac
+case $token$idx$len$secs in ''|*[!0-9]*) fail "bad argument";; esac
+d="/tmp/rex-file-paste-$(id -u)"
+k="$d/$key"
+[ ! -L "$d" ] && [ -O "$d" ] && [ -d "$k" ] && [ -O "$k" ] || fail "cannot use $k"
+p="$k/.rexfp.$token.$idx"
+stty raw -echo 2>/dev/null || fail "cannot set the terminal mode"
+( sleep "$secs"; kill 0 ) 2>/dev/null &
+say READY
+if head -c "$len" > "$p.tmp" && mv -f "$p.tmp" "$p" && : > "$p.ok"; then
+  say DONE
+else
+  rm -f "$p.tmp"
+  say "ERR could not receive part $idx"
 fi
 sleep 60
 ]=]
@@ -426,12 +479,13 @@ p="$HOME/Library/Application Support/com.superlogical.rex/RexServer/Versions/Cur
 end
 
 local JOB_OPTIONS = { "max_size_mb", "max_dimension", "convert_images", "timeout", "min_rate_mb",
-  "progress_after", "notify", "local_dir" }
+  "progress_after", "notify", "local_dir", "parallel", "parallel_min_mb", "module_dir" }
 
 -- Starts the worker for a copy to another server and returns the job file.
 local function start_job(ctx, entries)
   local opts = {}
   for _, k in ipairs(JOB_OPTIONS) do opts[k] = M.options[k] end
+  opts.rex_path = rex_path()
   local jobs = M.options.local_dir .. "/jobs"
   exec({ "mkdir", "-p", jobs })
   local job = jobs .. "/" .. staging_name() .. ".json"
@@ -443,7 +497,7 @@ local function start_job(ctx, entries)
   if not exists(worker) then fail("cannot find " .. worker .. "; set module_dir in setup{}") end
   if not (rex.exec and rex.exec.start) then fail("this version of Rex can't start a background command") end
   local h, err = rex.exec.start({ "sh", "-c", 'exec "$1" --autostart=false do "$2" job="$3" >>"$4" 2>&1',
-    "rex-file-paste", rex_path(), worker, job, M.options.local_dir .. "/worker.log" },
+    "rex-file-paste", opts.rex_path, worker, job, M.options.local_dir .. "/worker.log" },
     { detach = true, stdout = false, stderr = false })
   if not h then fail("cannot start the copy: " .. tostring(err)) end
   return job
@@ -525,79 +579,195 @@ local function progress_bar(api, session_id, block_id)
   return bar
 end
 
--- Copies one prepared file to the server behind api. Returns the remote path
--- and whether the server already had it.
-local function upload(api, session_id, file, state)
-  local len = 4 * math.ceil(file.size / 3)
-  local secs = math.ceil(state.deadline - now()) + 30
-  local block_id = must("start the copy terminal", api.call, "session.new_block", {
+-- Opens a hidden terminal on the server behind api, running argv. Returns
+-- functions to call its methods, read its screen, and close it.
+local function hidden_terminal(api, session_id, argv, what)
+  local block_id = must("start the " .. what .. " terminal", api.call, "session.new_block", {
     session_id = session_id,
     flavor = SHELL,
     label = "rex-file-paste",
-    options = {
-      shell = "none",
-      command = { "sh", "-c", REMOTE_SCRIPT, "rex-file-paste", file.key, file.name,
-        tostring(len), tostring(math.max(secs, 60)), file.sha },
-      size = { columns = 200, rows = 10 },
-    },
+    options = { shell = "none", command = argv, size = { columns = 200, rows = 10 } },
   }).block_id
-
-  local function call(method, args)
+  local t = {}
+  function t.call(method, args)
     return api.call("block.method", { session_id = session_id, block_id = block_id, method = method, args = args or {} })
   end
-  local function screen()
-    local s = call("format", { trim = true, unwrap = true })
+  function t.screen()
+    local s = t.call("format", { trim = true, unwrap = true })
     local text = s and s.content or ""
     local why = text:match("REXFP%-ERR ([^\r\n]+)")
-    if why then fail(file.name .. ": " .. why) end
+    if why then fail(what .. ": " .. why) end
     return text
   end
+  -- Waits until the screen matches one of the patterns, and returns the
+  -- index of the pattern and its captures.
+  function t.wait(patterns, check, doing)
+    while true do
+      local text = t.screen()
+      for i, pat in ipairs(patterns) do
+        local caps = { text:match(pat) }
+        if caps[1] then return i, unpack(caps) end
+      end
+      check(doing)
+      sleep(0.02)
+    end
+  end
+  function t.close() api.call("block.close", { session_id = session_id, block_id = block_id }) end
+  return t
+end
+
+-- Returns the file's base64, from byte offset (0-based) for length bytes,
+-- or the whole file.
+local function encode(path, offset, length)
+  local out
+  if offset then
+    out = exec({ "sh", "-c", 'tail -c +"$2" "$1" | head -c "$3" | base64', "rex-file-paste",
+      path, tostring(offset + 1), tostring(length) })
+  else
+    out = exec({ "base64", "-i", path })
+  end
+  -- macOS base64 writes one line. Drop its line end without scanning the
+  -- whole text; scan only if it ever wraps lines.
+  local last = #out
+  while last > 0 and out:byte(last) <= 32 do last = last - 1 end
+  out = out:sub(1, last)
+  if out:find("[\r\n]") then out = out:gsub("%s", "") end
+  return out
+end
+
+-- Types data into terminal t in requests of at most CHUNK bytes. Calls
+-- after(sent) every 16 requests and at the end.
+local function send(t, data, check, doing, after)
+  local n = 0
+  for i = 1, #data, CHUNK do
+    must("copy", t.call, "write", { data = data:sub(i, i + CHUNK - 1) })
+    n = n + 1
+    if n % 16 == 0 then after(math.min(i + CHUNK - 1, #data)) end
+    check(doing)
+  end
+  after(#data)
+  return n
+end
+
+-- The part sender, run by worker.lua as `rex do worker.lua part=SPEC.json`:
+-- types one part of a file into its own terminal on the remote server, and
+-- writes how much it sent to SPEC.progress for the worker's progress bar.
+function M.run_part(spec_path)
+  local spec = rex.json.decode(read_file(spec_path) or "") or fail("cannot read " .. spec_path)
+  local stop = os.time() + spec.secs
+  local function check(doing)
+    if os.time() >= stop then fail(string.format("gave up %s after %ds", doing, spec.secs)) end
+  end
+  local api = rex.server(spec.host)
+  api.call("session.attach", { session_id = spec.session_id })
+  local b64 = 4 * math.ceil(spec.length / 3)
+  local t = hidden_terminal(api, spec.session_id, { "sh", "-c", PART_SCRIPT, "rex-file-paste",
+    spec.key, spec.token, tostring(spec.index), tostring(b64), tostring(spec.secs + 30) }, "part " .. spec.index)
+  local ok, err = pcall(function()
+    t.wait({ "REXFP%-READY" }, check, "starting part " .. spec.index)
+    local data = encode(spec.path, spec.offset, spec.length)
+    if #data ~= b64 then fail("unexpected base64 length for part " .. spec.index) end
+    send(t, data, check, "copying part " .. spec.index, function(sent)
+      write_file(spec.progress, tostring(sent))
+    end)
+    t.wait({ "REXFP%-DONE" }, check, "waiting for part " .. spec.index)
+  end)
+  t.close()
+  os.remove(spec_path)
+  if not ok then error(err, 0) end
+  return { ok = true, index = spec.index }
+end
+
+-- Sends the parts of file at once, one `rex do` process each, while main
+-- (the REMOTE_SCRIPT terminal) waits for them.
+local function send_parts(job, file, parts, slice, token, state)
+  local worker = (M.options.module_dir or ".") .. "/worker.lua"
+  local dir = M.options.local_dir .. "/jobs"
+  local base = dir .. "/" .. staging_name()
+  local senders = {}
+  for i = 0, parts - 1 do
+    local offset = i * slice
+    local spec = base .. "-part" .. i .. ".json"
+    local progress = base .. "-part" .. i .. ".progress"
+    write_file(spec, rex.json.encode({
+      host = job.host, session_id = job.session_id, key = file.key, token = token, index = i,
+      path = file.path, offset = offset, length = math.min(slice, file.size - offset),
+      secs = math.ceil(state.deadline - now()) + 5, progress = progress,
+    }))
+    local h, err = rex.exec.start({ M.options.rex_path or "rex", "--autostart=false", "do", worker, "part=" .. spec })
+    if not h then fail("cannot start a part sender: " .. tostring(err)) end
+    senders[#senders + 1] = { h = h, progress = progress }
+  end
+  local base_sent = state.sent
+  while true do
+    local running, sent = false, 0
+    for _, s in ipairs(senders) do
+      running = running or s.h:running()
+      sent = sent + (tonumber(read_file(s.progress) or "") or 0)
+    end
+    state.sent = base_sent + sent
+    state.tick()
+    if not running then break end
+    local ok, err = pcall(state.check, "copying " .. file.name)
+    if not ok then
+      for _, s in ipairs(senders) do s.h:kill() end
+      error(err, 0)
+    end
+    sleep(0.1)
+  end
+  for i, s in ipairs(senders) do
+    local r = s.h:wait()
+    os.remove(s.progress)
+    if not (r and r.ok) then
+      local out = ((r and r.stdout or "") .. (r and r.stderr or "")):gsub("%s+$", "")
+      fail(string.format("part %d of %s failed: %s", i - 1, file.name, out:match("([^\n]*)$") or "?"))
+    end
+  end
+end
+
+-- Copies one prepared file to the server behind api. Returns the remote path
+-- and whether the server already had it.
+local function upload(api, job, file, state)
+  local len = 4 * math.ceil(file.size / 3)
+  local secs = math.ceil(state.deadline - now()) + 30
+  local parts, slice = 0, 0
+  if (M.options.parallel or 1) > 1 and file.size >= (M.options.parallel_min_mb or 2) * MiB then
+    -- Every part but the last holds a multiple of 3 bytes, so the parts'
+    -- base64 joins into the file's base64.
+    slice = 3 * math.ceil(math.ceil(file.size / M.options.parallel) / 3)
+    parts = math.ceil(file.size / slice)
+  end
+  local t = hidden_terminal(api, job.session_id, { "sh", "-c", REMOTE_SCRIPT, "rex-file-paste", file.key,
+    file.name, tostring(len), tostring(math.max(secs, 60)), file.sha, tostring(parts) }, file.name)
   local function remote_path(uid)
     return "/tmp/rex-file-paste-" .. uid .. "/" .. file.key .. "/" .. file.name
   end
 
   local ok, path, cached = pcall(function()
-    while true do
-      local text = screen()
-      local uid = text:match("REXFP%-HIT (%d+)")
-      if uid then return remote_path(uid), true end
-      if text:find("REXFP%-READY") then break end
-      state.check("starting the copy")
-      sleep(0.02)
-    end
+    local which, cap = t.wait({ "REXFP%-HIT (%d+)", "REXFP%-PARTS (%d+)", "REXFP%-READY" },
+      state.check, "starting the copy")
+    if which == 1 then return remote_path(cap), true end
     state.mark("remote ready for " .. file.name)
-    -- macOS base64 writes one line. Drop its line end without scanning the
-    -- whole text; scan only if it ever wraps lines.
-    local encoded = exec({ "base64", "-i", file.path })
-    local last = #encoded
-    while last > 0 and encoded:byte(last) <= 32 do last = last - 1 end
-    encoded = encoded:sub(1, last)
-    if #encoded ~= len then encoded = encoded:gsub("%s", "") end
-    state.mark("encoded " .. file.name)
-    if #encoded ~= len then fail("unexpected base64 length for " .. file.name) end
-    local n = 0
-    for i = 1, #encoded, CHUNK do
-      must("copy", call, "write", { data = encoded:sub(i, i + CHUNK - 1) })
-      n = n + 1
-      state.sent = state.sent + math.min(CHUNK, #encoded - i + 1)
-      if n % 16 == 0 then state.tick() end
-      state.check(string.format("copying %s (%s of %s sent)", file.name, mb(state.sent * 3 / 4), mb(state.total * 3 / 4)))
+    if which == 2 then
+      send_parts(job, file, parts, slice, cap, state)
+      state.mark(string.format("sent %s in %d parts", file.name, parts))
+    else
+      local data = encode(file.path)
+      if #data ~= len then fail("unexpected base64 length for " .. file.name) end
+      local base_sent = state.sent
+      local n = send(t, data, state.check, "copying " .. file.name, function(sent)
+        state.sent = base_sent + sent
+        state.tick()
+      end)
+      state.mark(string.format("sent %d requests for %s", n, file.name))
     end
-    state.tick()
-    state.mark(string.format("sent %d requests for %s", n, file.name))
-    while true do
-      local got, uid = screen():match("REXFP%-OK (%x+) (%d+)")
-      if got then
-        if got ~= file.sha then fail("checksum mismatch for " .. file.name) end
-        return remote_path(uid), false
-      end
-      state.check("waiting for the remote file")
-      sleep(0.05)
-    end
+    local _, got, uid = t.wait({ "REXFP%-OK (%x+) (%d+)" }, state.check, "waiting for the remote file")
+    if got ~= file.sha then fail("checksum mismatch for " .. file.name) end
+    return remote_path(uid), false
   end)
-  api.call("block.close", { session_id = session_id, block_id = block_id })
+  t.close()
   if not ok then error(path, 0) end
-  return path, cached
+  return path, cached, parts
 end
 
 -- The worker body: runs a job file written by M.paste. Writes the result
@@ -642,9 +812,9 @@ function M.run_job(job_path)
       last_tick = t
       bar.update(state.sent / total, string.format("%s / %s", mb(state.sent * 3 / 4), mb(total * 3 / 4)))
     end
-    local paths, cached = {}, {}
+    local paths, cached, parts = {}, {}, {}
     for i, f in ipairs(files) do
-      paths[i], cached[i] = upload(api, job.session_id, f, state)
+      paths[i], cached[i], parts[i] = upload(api, job, f, state)
       mark("copied " .. f.name .. (cached[i] and " (already there)" or ""))
     end
     if bar.opened then
@@ -653,7 +823,7 @@ function M.run_job(job_path)
     end
     paste_text(api, job.session_id, job.block_id, join_paths(paths))
     mark("pasted")
-    return { ok = true, pasted = "paths", paths = paths, cached = cached, bytes = bytes,
+    return { ok = true, pasted = "paths", paths = paths, cached = cached, parts = parts, bytes = bytes,
       timeout = seconds, progress = bar.opened or false, progress_line = bar.last,
       program_status = state.program_status }
   end)
